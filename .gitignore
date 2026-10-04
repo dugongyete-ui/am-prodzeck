@@ -74,3 +74,6 @@ server.log
 
 # Tool output captures (dev/debug only)
 /tool-results/
+
+# User-uploaded files (chat attachments, etc.)
+/upload/
