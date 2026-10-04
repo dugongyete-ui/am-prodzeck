@@ -389,7 +389,15 @@ export function splitApiKey(key: string): { prefix: string | null; valid: boolea
   if (!key) return { prefix: null, valid: false };
   const trimmed = key.trim();
   if (!trimmed.startsWith('dzk_')) return { prefix: null, valid: false };
-  const rest = trimmed.slice(4);
+  let rest = trimmed.slice(4);
+  // Accept BOTH apikey formats:
+  //   1. Legacy:     dzk_<32hex>            (no separator)
+  //   2. New (current): dzk_<8hex>_<24hex>  (with underscore for readability)
+  // The new format is what generateApiKeyWithPrefix() in /api/token/keys
+  // produces. The underscore must be stripped before the 32-hex regex check.
+  if (rest.length === 33 && rest[8] === '_') {
+    rest = rest.slice(0, 8) + rest.slice(9); // strip the underscore at position 8
+  }
   if (!/^[0-9a-f]{32}$/.test(rest)) return { prefix: null, valid: false };
   return { prefix: rest.slice(0, APIKEY_PREFIX_LEN), valid: true };
 }
