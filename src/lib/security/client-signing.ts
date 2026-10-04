@@ -41,11 +41,10 @@ function randomNonce(): string {
     .join('');
 }
 
-export interface SigningHeaders {
-  'X-Timestamp': string;
-  'X-Nonce': string;
-  'X-Signature': string;
-}
+export type SigningHeaders = Record<
+  'X-Timestamp' | 'X-Nonce' | 'X-Signature',
+  string
+> & Record<string, string>;
 
 // Build the signature headers for a state-changing admin request.
 //   method:  'POST' | 'PATCH' | 'DELETE' | 'PUT'
