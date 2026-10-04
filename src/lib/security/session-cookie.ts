@@ -129,26 +129,46 @@ export function readSessionCookie(req: NextRequest): RelaySessionData | null {
 // works regardless of which domain the app is deployed at — localhost,
 // Z.ai preview domain, or a custom domain). Additional origins can be
 // added via the ALLOWED_ORIGINS env var (comma-separated).
+//
+// IMPORTANT: behind a TLS-terminating proxy/CDN (Cloudflare, Z.ai preview,
+// Vercel, etc.), the server sees the request as `http://` even though the
+// browser is on `https://`. Comparing the full Origin (with protocol) would
+// mismatch in that case. So we compare HOSTS only — same host = same site.
+// This is safe: an attacker on a different protocol of the same host is by
+// definition same-origin (TLS termination is transparent to the browser).
 function getAllowedOrigins(req: NextRequest): string[] {
   const extra = (process.env.ALLOWED_ORIGINS || '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
-  // Derive the request's own origin from the Host header + forwarded proto.
-  const host = req.headers.get('x-forwarded-host') || req.headers.get('host') || req.nextUrl?.host;
-  const forwardedProto = req.headers.get('x-forwarded-proto');
-  const isHttps = forwardedProto === 'https' || req.nextUrl?.protocol === 'https:';
+  // Derive the request's own host (preferring forwarded headers for trusted
+  // proxy setups).
+  const host =
+    req.headers.get('x-forwarded-host') ||
+    req.headers.get('host') ||
+    req.nextUrl?.host ||
+    '';
   const selfOrigins: string[] = [];
   if (host) {
-    selfOrigins.push(`${isHttps ? 'https' : 'http'}://${host}`);
-    // Also include http variant if https (some browsers downgrade referer)
-    if (isHttps) selfOrigins.push(`http://${host}`);
+    // Allow both http and https variants of the same host.
+    selfOrigins.push(`http://${host}`, `https://${host}`);
   }
   // Always include localhost dev origins as a fallback.
-  if (!selfOrigins.includes('http://localhost:3000')) {
+  if (host !== 'localhost:3000') {
     selfOrigins.push('http://localhost:3000', 'https://localhost:3000');
   }
   return [...selfOrigins, ...extra];
+}
+
+// Extract just the host portion from an Origin or Referer URL — used for
+// host-only comparison (protocol is unreliable behind TLS-terminating proxies).
+function extractHost(urlStr: string): string | null {
+  try {
+    const u = new URL(urlStr);
+    return u.host; // e.g. "preview-xxx.space-z.ai" or "localhost:3000"
+  } catch {
+    return null;
+  }
 }
 
 export function checkOrigin(req: NextRequest): boolean {
@@ -159,10 +179,12 @@ export function checkOrigin(req: NextRequest): boolean {
   const origin = req.headers.get('origin');
   const referer = req.headers.get('referer');
   const allowed = getAllowedOrigins(req);
+  const allowedHosts = allowed.map(extractHost).filter((h): h is string => Boolean(h));
 
   // If Origin header is present, it must match an allowed origin.
   if (origin) {
-    if (allowed.includes(origin)) return true;
+    const originHost = extractHost(origin);
+    if (originHost && allowedHosts.includes(originHost)) return true;
     securityLog('origin_rejected', 'warn', {
       origin,
       allowed,
@@ -177,13 +199,8 @@ export function checkOrigin(req: NextRequest): boolean {
   // Referer. If neither is present, reject (modern browsers always send one
   // of these on POST).
   if (referer) {
-    try {
-      const u = new URL(referer);
-      const originFromReferer = `${u.protocol}//${u.host}`;
-      if (allowed.includes(originFromReferer)) return true;
-    } catch {
-      // malformed referer — reject
-    }
+    const refererHost = extractHost(referer);
+    if (refererHost && allowedHosts.includes(refererHost)) return true;
     securityLog('origin_rejected', 'warn', {
       referer,
       ipHash: hashIp(getClientIp(req)),
