@@ -1,8 +1,10 @@
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
 
-export const SESSION_FILE = path.resolve(process.cwd(), '.session.json');
+// SECURITY: the old SESSION_FILE helpers (loadLocalSession, saveLocalSession,
+// deleteLocalSession) have been REMOVED. Per-browser session state now lives
+// in a signed HttpOnly cookie (see src/lib/security/session-cookie.ts).
+// Removing these helpers eliminates the shared-state leak where any client
+// could hit GET /api/relay/session and read another client's sessionKey.
 
 export const DEFAULT_BASE_URL = 'https://am-web-three.vercel.app';
 export const DEFAULT_TIMEOUT = 30000;
@@ -72,27 +74,6 @@ export function decryptAesGcm(encBase64: string, keyBase64: string): any {
   return JSON.parse(decrypted.toString('utf8'));
 }
 
-export function loadLocalSession() {
-  if (!fs.existsSync(SESSION_FILE)) return null;
-  try {
-    return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
-  } catch {
-    return null;
-  }
-}
-
-export function saveLocalSession(data: any) {
-  try {
-    fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Gagal menyimpan .session.json', err);
-  }
-}
-
-export function deleteLocalSession() {
-  if (fs.existsSync(SESSION_FILE)) {
-    try {
-      fs.unlinkSync(SESSION_FILE);
-    } catch {}
-  }
-}
+// (loadLocalSession / saveLocalSession / deleteLocalSession removed — see
+// module header comment. Per-browser session state now lives in a signed
+// HttpOnly cookie via src/lib/security/session-cookie.ts.)

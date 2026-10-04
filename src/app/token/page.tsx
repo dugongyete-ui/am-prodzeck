@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import {
   Crown,
   KeyRound,
@@ -12,11 +12,14 @@ import {
   Copy,
   Check,
   LogOut,
+  AlertCircle,
 } from 'lucide-react';
+import { buildSigningHeaders } from '@/lib/security/client-signing';
 
 interface KeyRecord {
   id: string;
-  key: string;
+  keyMasked: string;
+  keyPrefix: string;
   emailCount: number;
   maxEmails: number;
   expired: boolean;
@@ -27,13 +30,10 @@ interface KeyRecord {
   notes: string | null;
 }
 
-// WA contact hint constants are intentionally NOT surfaced on the /token
-// admin page itself — the admin is the one already inside. These hints are
-// reserved for the public main app where users hit an expired/invalid apikey.
-
 export default function TokenAdminPage() {
   const [authed, setAuthed] = useState(false);
   const [checkingAuth, setCheckingAuth] = useState(true);
+  const [signingKey, setSigningKey] = useState<string>('');
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState('');
   const [loginLoading, setLoginLoading] = useState(false);
@@ -44,16 +44,22 @@ export default function TokenAdminPage() {
   const [newKeyNotes, setNewKeyNotes] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [actionError, setActionError] = useState('');
+  const [actionInfo, setActionInfo] = useState('');
+  const [newlyCreatedKey, setNewlyCreatedKey] = useState<string | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
 
-  // Check existing session cookie on mount (via /api/token/keys — returns 401 if not authed).
+  // Check existing session on mount (silent — no signing required for GET).
   useEffect(() => {
-    fetch('/api/token/keys', { credentials: 'include' })
-      .then((r) => {
+    fetch('/api/token/keys?limit=20', { credentials: 'include' })
+      .then(async (r) => {
         if (r.ok) {
           setAuthed(true);
-          return r.json().then((data) => {
-            setKeys(data.keys || []);
-          });
+          const data = await r.json();
+          setKeys(data.keys || []);
+          setNextCursor(data.nextCursor || null);
+          setHasMore(Boolean(data.hasMore));
         }
       })
       .catch(() => {})
@@ -72,12 +78,16 @@ export default function TokenAdminPage() {
         body: JSON.stringify({ password }),
       });
       const data = await res.json();
-      if (res.ok && data.ok) {
+      if (res.ok && data.ok && data.sessionToken) {
         setAuthed(true);
+        setSigningKey(data.signingKey || '');
         setPassword('');
-        loadKeys();
+        // The /api/token/auth response includes the signingKey for THIS
+        // session only. We hold it in memory — not localStorage — so it
+        // is lost on tab close (forcing re-auth).
+        await loadKeys();
       } else {
-        setLoginError(data?.error || 'Kata sandi salah.');
+        setLoginError(data?.error || 'Kredensial tidak valid.');
       }
     } catch (err: any) {
       setLoginError(err?.message || 'Gagal masuk. Coba lagi.');
@@ -86,40 +96,98 @@ export default function TokenAdminPage() {
     }
   };
 
+  // Update: server returns signingKey only on explicit login. We need to
+  // fetch it separately if the session was restored from cookie.
+  // Actually: server stores signingKey in-memory keyed by session token.
+  // If the cookie is valid but the in-memory entry was lost (server
+  // restart), admin can still GET (no signing required) but can't do
+  // state-changing ops. To handle that gracefully, we ask for a fresh
+  // signingKey via re-login when needed. For now, if signingKey is empty,
+  // state-changing buttons show "re-login required" tooltip.
+
   const handleLogout = async () => {
     await fetch('/api/token/auth', { method: 'DELETE', credentials: 'include' });
     setAuthed(false);
+    setSigningKey('');
     setKeys([]);
+    setNextCursor(null);
+    setHasMore(false);
   };
 
-  const loadKeys = async () => {
+  const loadKeys = useCallback(async () => {
     setKeysLoading(true);
     setActionError('');
     try {
-      const res = await fetch('/api/token/keys', { credentials: 'include' });
+      const res = await fetch('/api/token/keys?limit=20', { credentials: 'include' });
       const data = await res.json();
-      if (res.ok) setKeys(data.keys || []);
-      else setActionError(data?.error || 'Gagal memuat apikey.');
+      if (res.ok) {
+        setKeys(data.keys || []);
+        setNextCursor(data.nextCursor || null);
+        setHasMore(Boolean(data.hasMore));
+      } else {
+        setActionError(data?.error || 'Gagal memuat apikey.');
+      }
     } catch (err: any) {
       setActionError(err?.message || 'Gagal memuat apikey.');
     } finally {
       setKeysLoading(false);
     }
-  };
+  }, []);
+
+  const loadMore = useCallback(async () => {
+    if (!nextCursor) return;
+    setLoadingMore(true);
+    setActionError('');
+    try {
+      const url = `/api/token/keys?limit=20&cursor=${encodeURIComponent(nextCursor)}`;
+      const res = await fetch(url, { credentials: 'include' });
+      const data = await res.json();
+      if (res.ok) {
+        setKeys((prev) => [...prev, ...(data.keys || [])]);
+        setNextCursor(data.nextCursor || null);
+        setHasMore(Boolean(data.hasMore));
+      } else {
+        setActionError(data?.error || 'Gagal memuat halaman berikutnya.');
+      }
+    } catch (err: any) {
+      setActionError(err?.message || 'Gagal memuat halaman berikutnya.');
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [nextCursor]);
 
   const handleCreate = async () => {
     setActionError('');
+    setActionInfo('');
+    if (!signingKey) {
+      setActionError('Sesi signing key hilang. Logout lalu login ulang.');
+      return;
+    }
     setCreating(true);
     try {
+      const body = JSON.stringify({ notes: newKeyNotes.trim() || undefined });
+      const headers = await buildSigningHeaders(
+        'POST',
+        '/api/token/keys',
+        body,
+        signingKey
+      );
       const res = await fetch('/api/token/keys', {
         method: 'POST',
         credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ notes: newKeyNotes.trim() || undefined }),
+        headers: {
+          'Content-Type': 'application/json',
+          ...headers,
+        },
+        body,
       });
       const data = await res.json();
       if (res.ok && data.ok) {
         setNewKeyNotes('');
+        setNewlyCreatedKey(data.key?.key || null);
+        setActionInfo(
+          'Key dibuat. Salin sekarang — setelah ini hanya tampil sebagai dzk_xxx…'
+        );
         await loadKeys();
       } else {
         setActionError(data?.error || 'Gagal membuat apikey.');
@@ -132,14 +200,22 @@ export default function TokenAdminPage() {
   };
 
   const handleDelete = async (id: string) => {
+    if (!signingKey) {
+      setActionError('Sesi signing key hilang. Logout lalu login ulang.');
+      return;
+    }
     if (!confirm('Hapus apikey ini? Tindakan tidak bisa dibatalkan.')) return;
     setActionError('');
     try {
-      const res = await fetch(`/api/token/keys/${id}`, {
+      const pathname = `/api/token/keys/${id}`;
+      const body = '';
+      const headers = await buildSigningHeaders('DELETE', pathname, body, signingKey);
+      const res = await fetch(pathname, {
         method: 'DELETE',
         credentials: 'include',
+        headers,
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
         await loadKeys();
       } else {
@@ -151,14 +227,22 @@ export default function TokenAdminPage() {
   };
 
   const handleReset = async (id: string) => {
+    if (!signingKey) {
+      setActionError('Sesi signing key hilang. Logout lalu login ulang.');
+      return;
+    }
     if (!confirm('Reset hitungan email apikey ini ke 0? Apikey akan aktif kembali.')) return;
     setActionError('');
     try {
-      const res = await fetch(`/api/token/keys/${id}`, {
+      const pathname = `/api/token/keys/${id}`;
+      const body = '';
+      const headers = await buildSigningHeaders('PATCH', pathname, body, signingKey);
+      const res = await fetch(pathname, {
         method: 'PATCH',
         credentials: 'include',
+        headers,
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
         await loadKeys();
       } else {
@@ -291,6 +375,53 @@ export default function TokenAdminPage() {
       </header>
 
       <main className="flex-1 max-w-4xl w-full mx-auto px-3 sm:px-6 py-6 sm:py-8 space-y-5">
+        {/* Signing-key missing notice */}
+        {!signingKey && (
+          <div className="flex items-start gap-2.5 p-3 sm:p-4 rounded-xl bg-[#2A1F0F] border border-[#3D2F1A] text-[#E5C680]">
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+            <p className="text-[11px] sm:text-xs leading-relaxed">
+              Sesi signing key tidak tersedia di memori. Logout lalu login ulang untuk membuat/menghapus/reset apikey. Membaca daftar tetap berfungsi.
+            </p>
+          </div>
+        )}
+
+        {/* Newly-created key (one-time plaintext display) */}
+        {newlyCreatedKey && (
+          <div className="rounded-2xl bg-[#1F3A2A] border border-[#2A4A38] p-4 sm:p-5">
+            <div className="flex items-center gap-2 mb-3">
+              <Check className="w-4 h-4 text-[#7CC8A2]" />
+              <h3 className="text-sm sm:text-base font-semibold text-white">Apikey Baru Dibuat</h3>
+            </div>
+            <p className="text-[11px] text-[#A8B5A6] mb-3 leading-relaxed">
+              Salin sekarang. Setelah Anda menutup/klik halaman ini, key hanya tampil sebagai <code className="font-mono text-[#7CC8A2]">dzk_xxx…</code> di daftar.
+            </p>
+            <div className="flex items-center gap-2 bg-[#0F1612] border border-[#2A3A30] rounded-lg p-2.5">
+              <code className="font-mono text-[11px] sm:text-xs text-[#E8EDE5] break-all flex-1">
+                {newlyCreatedKey}
+              </code>
+              <button
+                onClick={() => {
+                  handleCopy(newlyCreatedKey, 'newly-created');
+                }}
+                className="p-1.5 rounded-md text-[#A8B5A6] hover:text-white hover:bg-[#22312A] transition-colors cursor-pointer shrink-0"
+                title="Salin key"
+              >
+                {copiedId === 'newly-created' ? (
+                  <Check className="w-3.5 h-3.5 text-[#7CC8A2]" />
+                ) : (
+                  <Copy className="w-3.5 h-3.5" />
+                )}
+              </button>
+            </div>
+            <button
+              onClick={() => setNewlyCreatedKey(null)}
+              className="mt-3 text-[11px] text-[#7E9788] hover:text-white transition-colors"
+            >
+              Tutup
+            </button>
+          </div>
+        )}
+
         {/* Create new apikey card */}
         <div className="rounded-2xl bg-[#1A241E] border border-[#2A3A30] p-4 sm:p-5">
           <div className="flex items-center gap-2 mb-3">
@@ -311,7 +442,8 @@ export default function TokenAdminPage() {
             />
             <button
               onClick={handleCreate}
-              disabled={creating}
+              disabled={creating || !signingKey}
+              title={!signingKey ? 'Logout lalu login ulang' : ''}
               className="flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-lg text-xs font-semibold text-white bg-gradient-to-r from-[#3D5A46] to-[#2A4233] hover:from-[#324B3A] hover:to-[#1F2F25] disabled:opacity-50 disabled:pointer-events-none transition-all shadow-sm cursor-pointer whitespace-nowrap"
             >
               {creating ? (
@@ -327,6 +459,9 @@ export default function TokenAdminPage() {
               )}
             </button>
           </div>
+          {actionInfo && (
+            <p className="text-[11px] text-[#7CC8A2] mt-3 leading-relaxed">{actionInfo}</p>
+          )}
           {actionError && (
             <p role="alert" className="text-[11px] text-[#D98080] mt-3 leading-relaxed">
               {actionError}
@@ -341,7 +476,7 @@ export default function TokenAdminPage() {
               Daftar Apikey
             </h2>
             <span className="text-[11px] text-[#7E9788] font-mono">
-              {keys.length} total
+              {keys.length}{hasMore ? '+' : ''} tampil
             </span>
           </div>
 
@@ -351,84 +486,91 @@ export default function TokenAdminPage() {
               <p className="text-xs">Belum ada apikey. Buat baru di atas.</p>
             </div>
           ) : (
-            <ul className="divide-y divide-[#1F2A24]">
-              {keys.map((k) => {
-                const remaining = Math.max(0, k.maxEmails - k.emailCount);
-                const isExpired = k.expired || k.emailCount >= k.maxEmails;
-                return (
-                  <li key={k.id} className="px-4 sm:px-5 py-4 space-y-3">
-                    {/* Key + copy + status */}
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2 mb-1.5">
+            <>
+              <ul className="divide-y divide-[#1F2A24]">
+                {keys.map((k) => {
+                  const remaining = Math.max(0, k.maxEmails - k.emailCount);
+                  const isExpired = k.expired || k.emailCount >= k.maxEmails;
+                  return (
+                    <li key={k.id} className="px-4 sm:px-5 py-4 space-y-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
                           <code className="font-mono text-[11px] sm:text-xs text-[#E8EDE5] bg-[#0F1612] px-2 py-1 rounded border border-[#2A3A30] break-all">
-                            {k.key}
+                            {k.keyMasked}
                           </code>
-                        </div>
-                        <div className="flex flex-wrap items-center gap-1.5 text-[10px] sm:text-[11px]">
-                          <span
-                            className={`px-2 py-0.5 rounded-full font-medium ${
-                              isExpired
-                                ? 'bg-[#3A1F1F] text-[#D98080] border border-[#4A2828]'
-                                : 'bg-[#1F3A2A] text-[#7CC8A2] border border-[#2A4A38]'
-                            }`}
-                          >
-                            {isExpired ? 'Expired' : `Aktif · sisa ${remaining}/${k.maxEmails}`}
-                          </span>
-                          <span className="text-[#5C6B5E]">
-                            dibuat {new Date(k.createdAt).toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' })}
-                          </span>
-                          {k.lastUsedAt && (
-                            <span className="text-[#5C6B5E]">
-                              · dipakai {new Date(k.lastUsedAt).toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' })}
+                          <div className="flex flex-wrap items-center gap-1.5 text-[10px] sm:text-[11px] mt-1.5">
+                            <span
+                              className={`px-2 py-0.5 rounded-full font-medium ${
+                                isExpired
+                                  ? 'bg-[#3A1F1F] text-[#D98080] border border-[#4A2828]'
+                                  : 'bg-[#1F3A2A] text-[#7CC8A2] border border-[#2A4A38]'
+                              }`}
+                            >
+                              {isExpired ? 'Expired' : `Aktif · sisa ${remaining}/${k.maxEmails}`}
                             </span>
+                            <span className="text-[#5C6B5E]">
+                              dibuat {new Date(k.createdAt).toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' })}
+                            </span>
+                            {k.lastUsedAt && (
+                              <span className="text-[#5C6B5E]">
+                                · dipakai {new Date(k.lastUsedAt).toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' })}
+                              </span>
+                            )}
+                          </div>
+                          {k.lastEmail && (
+                            <p className="text-[10px] text-[#5C6B5E] mt-1 truncate">
+                              email terakhir: <span className="font-mono">{k.lastEmail}</span>
+                            </p>
+                          )}
+                          {k.notes && (
+                            <p className="text-[10px] text-[#7E9788] mt-1 italic">&quot;{k.notes}&quot;</p>
                           )}
                         </div>
-                        {k.lastEmail && (
-                          <p className="text-[10px] text-[#5C6B5E] mt-1 truncate">
-                            email terakhir: <span className="font-mono">{k.lastEmail}</span>
-                          </p>
-                        )}
-                        {k.notes && (
-                          <p className="text-[10px] text-[#7E9788] mt-1 italic">"{k.notes}"</p>
-                        )}
-                      </div>
 
-                      {/* Copy + actions */}
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          onClick={() => handleCopy(k.key, k.id)}
-                          title="Salin apikey"
-                          className="p-1.5 rounded-md text-[#A8B5A6] hover:text-white hover:bg-[#22312A] transition-colors cursor-pointer"
-                        >
-                          {copiedId === k.id ? (
-                            <Check className="w-3.5 h-3.5 text-[#7CC8A2]" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5" />
+                        <div className="flex items-center gap-1 shrink-0">
+                          {isExpired && (
+                            <button
+                              onClick={() => handleReset(k.id)}
+                              disabled={!signingKey}
+                              title="Reset hitungan ke 0"
+                              className="p-1.5 rounded-md text-[#A8B5A6] hover:text-white hover:bg-[#22312A] transition-colors cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                            </button>
                           )}
-                        </button>
-                        {isExpired && (
                           <button
-                            onClick={() => handleReset(k.id)}
-                            title="Reset hitungan ke 0"
-                            className="p-1.5 rounded-md text-[#A8B5A6] hover:text-white hover:bg-[#22312A] transition-colors cursor-pointer"
+                            onClick={() => handleDelete(k.id)}
+                            disabled={!signingKey}
+                            title="Hapus apikey"
+                            className="p-1.5 rounded-md text-[#D98080] hover:text-white hover:bg-[#3A1F1F] transition-colors cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
                           >
-                            <RefreshCw className="w-3.5 h-3.5" />
+                            <Trash2 className="w-3.5 h-3.5" />
                           </button>
-                        )}
-                        <button
-                          onClick={() => handleDelete(k.id)}
-                          title="Hapus apikey"
-                          className="p-1.5 rounded-md text-[#D98080] hover:text-white hover:bg-[#3A1F1F] transition-colors cursor-pointer"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        </div>
                       </div>
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
+                    </li>
+                  );
+                })}
+              </ul>
+              {hasMore && (
+                <div className="px-4 sm:px-5 py-4 border-t border-[#1F2A24] text-center">
+                  <button
+                    onClick={loadMore}
+                    disabled={loadingMore}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium text-[#A8B5A6] hover:text-white bg-[#0F1612] border border-[#2A3A30] hover:bg-[#22312A] transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    {loadingMore ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Memuat...</span>
+                      </>
+                    ) : (
+                      <span>Muat lebih banyak</span>
+                    )}
+                  </button>
+                </div>
+              )}
+            </>
           )}
         </div>
 

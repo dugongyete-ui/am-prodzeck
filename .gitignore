@@ -52,7 +52,6 @@ prompt
 server.log
 # Skills directory
 /skills/
-
 # SQLite database (contains apikeys + sessions — never commit)
 /db/*.db
 /db/*.db-journal
@@ -69,3 +68,9 @@ server.log
 
 # Standalone scripts used during development only
 /scripts/
+
+# Test scripts (Z.ai internal)
+/tests/
+
+# Tool output captures (dev/debug only)
+/tool-results/

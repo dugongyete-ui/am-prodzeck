@@ -2,15 +2,62 @@ import { NextRequest, NextResponse } from 'next/server';
 import {
   buildHeaders,
   DEFAULT_BASE_URL,
-  DEFAULT_TIMEOUT,
   decryptAesGcm,
   generateSessionKey,
-  loadLocalSession,
-  saveLocalSession,
 } from '@/lib/relay/relay';
+import {
+  checkOrigin,
+  clearSessionCookie,
+  contactHint,
+  readSessionCookie,
+  type RelaySessionData,
+} from '@/lib/security/session-cookie';
+import { checkRateLimit, rateLimitKey } from '@/lib/security/rate-limit';
+import { getClientIp, hashIp } from '@/lib/security/ip';
+import { securityLog } from '@/lib/security/security-log';
+
+const IP_LIMIT = 20;
+const IP_WINDOW_MS = 10 * 60 * 1000;
 
 export async function POST(req: NextRequest) {
   const startTime = Date.now();
+
+  if (!checkOrigin(req)) {
+    securityLog('csrf_invalid', 'warn', {
+      endpoint: '/api/relay/verify-link',
+      ipHash: hashIp(getClientIp(req)),
+    });
+    return NextResponse.json(
+      { ok: false, error: 'Permintaan ditolak (origin verification gagal).' },
+      { status: 403 }
+    );
+  }
+
+  const ip = getClientIp(req);
+  const ipHash = hashIp(ip);
+
+  const rl = checkRateLimit(rateLimitKey('verifylink:ip', ip), IP_LIMIT, IP_WINDOW_MS);
+  if (!rl.allowed) {
+    securityLog('rate_limit_hit', 'warn', {
+      endpoint: '/api/relay/verify-link',
+      ipHash,
+      limit: IP_LIMIT,
+      retryAfterSec: rl.retryAfterSec,
+    });
+    return NextResponse.json(
+      {
+        ok: false,
+        status: 429,
+        error: 'Terlalu banyak permintaan. Coba lagi beberapa saat.',
+        retryAfter: rl.retryAfterSec,
+      },
+      {
+        status: 429,
+        headers: { 'Retry-After': String(rl.retryAfterSec) },
+      }
+    );
+  }
+
   const body = await req.json().catch(() => ({}));
   const {
     input,
@@ -34,14 +81,19 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const cleanBaseUrl = baseUrl.replace(/\/+$/, '');
-  const headers = buildHeaders(cleanBaseUrl, customHeaders);
-  const session = loadLocalSession() || {};
+  // Read per-browser signed session cookie (replaces the old shared
+  // .session.json file). This cookie contains the sessionKey/nonce/
+  // challenge/pow generated during send-link.
+  const sess = readSessionCookie(req);
 
-  const effectiveEmail = clientEmail || session.email || '';
+  // Allow client to override email/sessionKey/nonce via request body for
+  // advanced use, but prefer cookie values (more trustworthy, server-issued).
+  const effectiveEmail =
+    (clientEmail as string | undefined) || sess?.email || '';
   const effectiveSessionKey =
-    clientSessionKey || session.sessionKey || generateSessionKey();
-  const effectiveNonce = clientNonce || session.nonce || null;
+    (clientSessionKey as string | undefined) || sess?.sessionKey || generateSessionKey();
+  const effectiveNonce =
+    (clientNonce as string | undefined) || sess?.nonce || null;
 
   if (!effectiveEmail) {
     return NextResponse.json(
@@ -49,7 +101,7 @@ export async function POST(req: NextRequest) {
         ok: false,
         status: 400,
         error:
-          'Email sesi belum tersedia. Harap jalankan Tahap 1 (Kirim Email) terlebih dahulu agar kunci sesi dan nonce dibuat.',
+          'Email sesi belum tersedia. Harap jalankan Tahap 1 (Kirim Email) terlebih dahulu.',
         durationMs: Date.now() - startTime,
         attempts: 1,
       },
@@ -57,8 +109,10 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  const cleanBaseUrl = baseUrl.replace(/\/+$/, '');
+  const headers = buildHeaders(cleanBaseUrl, customHeaders);
+
   try {
-    // Protocol payload for verify-link
     const verifyPayload = {
       email: effectiveEmail,
       magicLink: input.trim(),
@@ -74,19 +128,20 @@ export async function POST(req: NextRequest) {
 
     const resJson = await response.json();
     let finalData = resJson;
-
-    // Decrypt if server returned encrypted payload
     if (resJson.enc) {
       try {
         finalData = decryptAesGcm(resJson.enc, effectiveSessionKey);
-      } catch (err: any) {
-        console.error('Decryption verify error:', err);
+      } catch {
+        securityLog('relay_upstream_error', 'error', {
+          endpoint: '/api/relay/verify-link',
+          reason: 'decryption_failed',
+          ipHash,
+        });
         return NextResponse.json(
           {
             ok: false,
             status: 502,
-            data: resJson,
-            error: 'Gagal mendeskripsi respon verifikasi (kunci sesi tidak cocok).',
+            error: 'Gagal memproses respon verifikasi.',
             durationMs: Date.now() - startTime,
             attempts: 1,
           },
@@ -98,38 +153,58 @@ export async function POST(req: NextRequest) {
     const durationMs = Date.now() - startTime;
     const ok = response.ok && finalData.success !== false;
 
-    const updatedSession = {
-      ...session,
-      email: effectiveEmail,
-      sessionKey: effectiveSessionKey,
-      lastVerifyInput: input.trim(),
-      lastVerifyResponse: finalData,
-      accountData: finalData.data || null,
-      verifiedAt: ok ? new Date().toISOString() : session.verifiedAt || null,
-    };
-    saveLocalSession(updatedSession);
-
-    return NextResponse.json(
+    // RESPONSE MINIMIZATION: don't echo back the upstream's full response.
+    // Only return the fields the client actually needs.
+    const res = NextResponse.json(
       {
         ok,
         status: ok ? 200 : response.status || 400,
-        headers: {},
-        data: finalData,
         durationMs,
         attempts: 1,
-        session: updatedSession,
-        accountData: finalData.data || null,
+        data: ok
+          ? {
+              success: finalData.success,
+              message: finalData.message,
+              email: finalData.email || effectiveEmail,
+              uid: finalData.uid,
+              orderId: finalData.orderId,
+              idToken: finalData.idToken,
+            }
+          : {
+              success: false,
+              message: finalData.message || 'Verifikasi gagal.',
+            },
+        apiKeyRemaining: sess?.apiKeyRemaining ?? null,
+        apiKeyMax: sess?.apiKeyMax ?? null,
+        ...contactHint(),
       },
       { status: ok ? 200 : response.status || 400 }
     );
+
+    // On success, clear the session cookie — the activation is done.
+    if (ok) {
+      clearSessionCookie(res);
+      securityLog('apikey_quota_used', 'info', {
+        event: 'verify_success',
+        ipHash,
+        email: effectiveEmail,
+        apiKeyId: sess?.apiKeyId,
+      });
+    }
+
+    return res;
   } catch (err: any) {
+    securityLog('relay_upstream_error', 'error', {
+      endpoint: '/api/relay/verify-link',
+      ipHash,
+      error: err?.message || 'unknown',
+    });
     const durationMs = Date.now() - startTime;
     return NextResponse.json(
       {
         ok: false,
         status: 500,
-        data: null,
-        error: err.message || 'Kesalahan koneksi saat memverifikasi tautan.',
+        error: 'Kesalahan koneksi saat memverifikasi tautan.',
         durationMs,
         attempts: 1,
       },
@@ -137,3 +212,6 @@ export async function POST(req: NextRequest) {
     );
   }
 }
+
+// Suppress unused var lint for RelaySessionData (type-only import).
+void (null as unknown as RelaySessionData);

@@ -12,12 +12,15 @@ function readAdminPassword(): string {
   return v;
 }
 
-const SESSION_SECRET = process.env.TOKEN_SESSION_SECRET || 'dzeck-token-admin-session-v1-fallback';
+// HMAC signing secret for admin session tokens. Same idea: env var first,
+// fallback to a per-process random value in dev.
+const SESSION_SECRET =
+  process.env.TOKEN_SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 
 export function verifyAdminPassword(input: string | undefined | null): boolean {
   const expected = readAdminPassword();
   if (!expected || !input) return false;
-  // Constant-time compare to avoid timing leaks.
+  // Constant-time compare — no early-return timing leak.
   try {
     const a = Buffer.from(input);
     const b = Buffer.from(expected);
@@ -28,11 +31,14 @@ export function verifyAdminPassword(input: string | undefined | null): boolean {
   }
 }
 
-// Generate a signed session token so the admin client doesn't have to
-// keep re-sending the raw password on every request. Token = base64(payload).signature
-// where signature = HMAC-SHA256(payload, SESSION_SECRET). Verifiable server-side.
+// Generate a signed session token. Token = base64url(payload).hex_signature
+// where signature = HMAC-SHA256(payload_b64, SESSION_SECRET). Verifiable
+// server-side without keeping per-token state (stateless).
 export function createSessionToken(): string {
-  const payload = JSON.stringify({ t: Date.now(), seed: crypto.randomBytes(8).toString('hex') });
+  const payload = JSON.stringify({
+    t: Date.now(),
+    seed: crypto.randomBytes(8).toString('hex'),
+  });
   const payloadB64 = Buffer.from(payload, 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payloadB64).digest('hex');
   return `${payloadB64}.${sig}`;
@@ -54,14 +60,15 @@ export function verifySessionToken(token: string | undefined | null): boolean {
   }
 }
 
-// API key generator: dzk_<32 hex chars> = 37 chars, easy to copy/paste,
-// has a recognizable prefix, and enough entropy to be unguessable.
+// API key generator: returns `dzk_<32 hex chars>`. The first 8 hex chars
+// after `dzk_` are used as a non-secret lookup prefix (indexed in DB);
+// the remaining 24 hex chars are the secret (compared via SHA-256 hash).
 export function generateApiKey(): string {
   return 'dzk_' + crypto.randomBytes(16).toString('hex');
 }
 
 export const MAX_EMAILS_PER_KEY = 3;
 
-export const ADMIN_WHATSAPP_URL = 'https://wa.me/6282120056647';
-export const ADMIN_WHATSAPP_TEXT =
-  'Silahkan hubungi admin ke nomor WA wa.me/6282120056647 untuk minta apikey AM Premium baru.';
+// (ADMIN_WHATSAPP_URL / ADMIN_WHATSAPP_TEXT moved to
+// src/lib/security/session-cookie.ts so all security + anti-enumeration
+// helpers live in one place.)

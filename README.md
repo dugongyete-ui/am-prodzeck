@@ -93,10 +93,53 @@ never commit `.env` to git).
 - `TOKEN_ADMIN_PASSWORD` (env var, required): admin password for `/token`.
   If not set, all login attempts fail. Must be ≥ 6 chars.
 - `TOKEN_SESSION_SECRET` (env var, optional): secret used to HMAC-sign admin
-  session cookies. Set to a long random string in production.
-- `ADMIN_WHATSAPP_URL` / `ADMIN_WHATSAPP_TEXT` (in `src/lib/token/auth.ts`):
-  the WhatsApp contact shown to users when their apikey is
-  missing/unknown/expired.
+  session tokens. Set to a long random string in production.
+- `SESSION_COOKIE_SECRET` (env var, optional): HMAC secret for the per-browser
+  signed session cookie used by the relay flow. Random fallback in dev.
+- `SESSION_COOKIE_SALT` (env var, optional): salt marker for the session
+  cookie. Rotating it invalidates all existing session cookies.
+- `ALLOWED_ORIGINS` (env var, optional): comma-separated list of allowed
+  Origin values for CSRF check on state-changing requests. In production,
+  set to your public domain (e.g. `https://dzeck-alightmotion.space-z.ai`).
+- `TRUSTED_PROXY_CIDRS` (env var, optional): comma-separated CIDRs trusted
+  to set `X-Forwarded-For`. Set to your CDN's CIDRs in production.
+
+## Security Architecture
+
+This app implements server-side hardening against scraping and automated
+abuse. The frontend remains functional for legitimate users; the server
+rejects unauthorized/scripted traffic.
+
+- **Centralized security layer** (`src/lib/security/`): rate limiting,
+  IP extraction (trusted-proxy aware), CSRF/Origin check, HMAC request
+  signing with anti-replay, signed per-browser session cookie, structured
+  security logging.
+- **API key hashing**: keys are stored as `keyPrefix` (non-secret, indexed
+  for lookup) + `keyHash` (SHA-256). Plaintext is shown only once on
+  creation. Lookup uses `crypto.timingSafeEqual` to avoid timing leaks.
+- **Rate limiting**: in-memory sliding window per IP / per admin session /
+  per apikey prefix. Sensitive endpoints have tighter limits.
+- **Anti-enumeration**: invalid / unknown / expired apikeys all return the
+  same generic message ("Apikey tidak valid atau sudah tidak aktif") with
+  the WhatsApp contact hint.
+- **Request signing (admin only)**: state-changing admin requests
+  (POST/PATCH/DELETE on `/api/token/keys*`) require `X-Timestamp`,
+  `X-Nonce`, `X-Signature` headers. Server verifies ±60s skew + nonce
+  freshness (5-min replay window) + HMAC-SHA256 signature.
+- **Signed session cookie**: per-browser state (`sessionKey`, `nonce`,
+  `challenge`, `pow`) lives in an HttpOnly, SameSite=Lax, 15-min TTL
+  signed cookie. Replaces the old shared `.session.json` file (which
+  leaked session state to anyone hitting `/api/relay/session`).
+- **Removed endpoints**: `/api/relay/session` is blocked by middleware
+  (defense-in-depth fallback even if the route file is recreated).
+- **Security headers**: CSP, X-Content-Type-Options, X-Frame-Options,
+  Referrer-Policy, Permissions-Policy, HSTS are injected globally by
+  `src/middleware.ts`. No `Access-Control-Allow-Origin: *` is set anywhere.
+- **Response minimization**: API responses only include fields the client
+  needs. Internal IDs, hashes, IP hashes, and upstream `sessionKey` are
+  never returned to the browser.
+- **Production build**: source maps disabled; `console.debug` stripped;
+  TypeScript and ESLint errors fail the build in production.
 
 ## License
 

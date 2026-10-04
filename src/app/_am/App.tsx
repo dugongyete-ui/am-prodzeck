@@ -55,17 +55,11 @@ export default function App() {
       setApiKey(savedKey);
     }
 
-    fetch('/api/relay/session')
-      .then((res) => res.json())
-      .then((data) => {
-        if (data?.session) {
-          setSession((prev) => ({ ...(prev || {}), ...data.session }));
-          if (typeof data.session.apiKeyRemaining === 'number') {
-            setApiKeyRemaining(data.session.apiKeyRemaining);
-          }
-        }
-      })
-      .catch(() => {});
+    // SECURITY: we no longer call GET /api/relay/session — that route is
+    // removed and blocked by middleware. Per-browser server-side state
+    // (sessionKey, nonce, challenge, pow) lives in a signed HttpOnly
+    // cookie that the server reads on verify-link. The client never sees
+    // those values.
 
     try {
       const storedHistory = localStorage.getItem('auralink_clean_history_v1');
@@ -182,9 +176,9 @@ export default function App() {
     setApiKeyRemaining(null);
     setContactHint(null);
     setWhatsappUrl(null);
-    try {
-      await fetch('/api/relay/session', { method: 'DELETE' });
-    } catch {}
+    // SECURITY: we no longer DELETE /api/relay/session. The server-side
+    // signed cookie will expire on its own (15-min TTL); we just clear
+    // the client-side localStorage session.
     showToast('Sesi direset. Siap untuk aktivasi baru.');
   };
 

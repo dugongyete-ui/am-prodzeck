@@ -33,8 +33,13 @@ model Post {
 
 model ApiKey {
   id         String    @id @default(cuid())
-  key        String    @unique
+  // SECURITY: never store the plaintext key. Store a non-secret prefix
+  // (first 8 hex chars after `dzk_`) for fast indexed lookup, and a SHA-256
+  // hash of the full key for constant-time verification.
+  keyPrefix  String    @unique
+  keyHash    String    @unique
   emailCount Int       @default(0)
+  maxEmails  Int       @default(3)
   expired    Boolean   @default(false)
   expiredAt  DateTime?
   createdAt  DateTime  @default(now())
@@ -42,6 +47,11 @@ model ApiKey {
   notes      String?
   lastUsedAt DateTime?
   lastEmail  String?
+  // Audit trail for abuse detection (without storing IP itself — store a
+  // salted hash of IP so we can correlate bursts from same IP without
+  // leaking the IP if the DB is dumped).
+  createdIpHash String?
 
+  @@index([keyPrefix])
   @@map("api_keys")
 }
