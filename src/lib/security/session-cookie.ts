@@ -124,14 +124,31 @@ export function readSessionCookie(req: NextRequest): RelaySessionData | null {
 // already prevents most CSRF in modern browsers; this is defense-in-depth.)
 // ────────────────────────────────────────────────────────────────────
 
-function getExpectedOrigins(): string[] {
+// Build the list of allowed Origin values for CSRF check on state-changing
+// requests. The "self" origin is derived from the request itself (so it
+// works regardless of which domain the app is deployed at — localhost,
+// Z.ai preview domain, or a custom domain). Additional origins can be
+// added via the ALLOWED_ORIGINS env var (comma-separated).
+function getAllowedOrigins(req: NextRequest): string[] {
   const extra = (process.env.ALLOWED_ORIGINS || '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
-  const base = ['http://localhost:3000', 'https://localhost:3000'];
-  // For prod deployments behind a domain, set ALLOWED_ORIGINS env var.
-  return [...base, ...extra];
+  // Derive the request's own origin from the Host header + forwarded proto.
+  const host = req.headers.get('x-forwarded-host') || req.headers.get('host') || req.nextUrl?.host;
+  const forwardedProto = req.headers.get('x-forwarded-proto');
+  const isHttps = forwardedProto === 'https' || req.nextUrl?.protocol === 'https:';
+  const selfOrigins: string[] = [];
+  if (host) {
+    selfOrigins.push(`${isHttps ? 'https' : 'http'}://${host}`);
+    // Also include http variant if https (some browsers downgrade referer)
+    if (isHttps) selfOrigins.push(`http://${host}`);
+  }
+  // Always include localhost dev origins as a fallback.
+  if (!selfOrigins.includes('http://localhost:3000')) {
+    selfOrigins.push('http://localhost:3000', 'https://localhost:3000');
+  }
+  return [...selfOrigins, ...extra];
 }
 
 export function checkOrigin(req: NextRequest): boolean {
@@ -141,13 +158,14 @@ export function checkOrigin(req: NextRequest): boolean {
   }
   const origin = req.headers.get('origin');
   const referer = req.headers.get('referer');
-  const allowed = getExpectedOrigins();
+  const allowed = getAllowedOrigins(req);
 
-  // If Origin header is present, it must match.
+  // If Origin header is present, it must match an allowed origin.
   if (origin) {
     if (allowed.includes(origin)) return true;
     securityLog('origin_rejected', 'warn', {
       origin,
+      allowed,
       ipHash: hashIp(getClientIp(req)),
       endpoint: req.nextUrl?.pathname || req.url,
       method,
