@@ -19,7 +19,10 @@ import { NextRequest, NextResponse } from 'next/server';
 
 const SECURITY_HEADERS: Record<string, string> = {
   'X-Content-Type-Options': 'nosniff',
-  'X-Frame-Options': 'DENY',
+  // X-Frame-Options removed — replaced by CSP frame-ancestors below,
+  // which is more expressive and allows the Z.ai chat preview iframe
+  // (chat.z.ai) and Z.ai preview domains (*.space-z.ai) to embed our
+  // app while still blocking arbitrary third-party sites.
   'Referrer-Policy': 'strict-origin-when-cross-origin',
   'Permissions-Policy':
     'camera=(), microphone=(), geolocation=(), payment=(), usb=(), accelerometer=(), gyroscope=()',
@@ -31,6 +34,11 @@ const SECURITY_HEADERS: Record<string, string> = {
   // `connect-src 'self'` blocks cross-origin fetches (so the relay
   // endpoint can't be replaced with an external URL by an attacker who
   // finds an XSS).
+  //
+  // `frame-ancestors` allows the Z.ai chat page (chat.z.ai) and Z.ai
+  // preview domains (*.space-z.ai) to embed this app in an iframe —
+  // this is REQUIRED for the Z.ai chat preview to render the deployed
+  // app. Without this, the preview shows a sad-file icon.
   'Content-Security-Policy': [
     "default-src 'self'",
     "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
@@ -38,7 +46,7 @@ const SECURITY_HEADERS: Record<string, string> = {
     "font-src 'self' https://fonts.gstatic.com",
     "img-src 'self' data: https:",
     "connect-src 'self'",
-    "frame-ancestors 'none'",
+    "frame-ancestors 'self' https://chat.z.ai https://*.space-z.ai",
     "form-action 'self'",
     "base-uri 'self'",
     "object-src 'none'",
