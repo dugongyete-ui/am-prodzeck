@@ -124,11 +124,15 @@ export function readSessionCookie(req: NextRequest): RelaySessionData | null {
 // already prevents most CSRF in modern browsers; this is defense-in-depth.)
 // ────────────────────────────────────────────────────────────────────
 
-// Build the list of allowed Origin values for CSRF check on state-changing
-// requests. The "self" origin is derived from the request itself (so it
+// Build the list of allowed HOSTS for CSRF check on state-changing
+// requests. The "self" hosts are derived from the request itself (so it
 // works regardless of which domain the app is deployed at — localhost,
-// Z.ai preview domain, or a custom domain). Additional origins can be
-// added via the ALLOWED_ORIGINS env var (comma-separated).
+// Z.ai preview domain, or a custom domain).
+//
+// We collect hosts from MULTIPLE header sources because serverless platforms
+// (Alibaba Function Compute, Vercel, AWS Lambda, etc.) often override the
+// Host header with an internal hostname while preserving the original public
+// host in a forwarded header.
 //
 // IMPORTANT: behind a TLS-terminating proxy/CDN (Cloudflare, Z.ai preview,
 // Vercel, etc.), the server sees the request as `http://` even though the
@@ -136,28 +140,27 @@ export function readSessionCookie(req: NextRequest): RelaySessionData | null {
 // mismatch in that case. So we compare HOSTS only — same host = same site.
 // This is safe: an attacker on a different protocol of the same host is by
 // definition same-origin (TLS termination is transparent to the browser).
-function getAllowedOrigins(req: NextRequest): string[] {
-  const extra = (process.env.ALLOWED_ORIGINS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  // Derive the request's own host (preferring forwarded headers for trusted
-  // proxy setups).
-  const host =
-    req.headers.get('x-forwarded-host') ||
-    req.headers.get('host') ||
-    req.nextUrl?.host ||
-    '';
-  const selfOrigins: string[] = [];
-  if (host) {
-    // Allow both http and https variants of the same host.
-    selfOrigins.push(`http://${host}`, `https://${host}`);
+function getAllowedHosts(req: NextRequest): string[] {
+  const hosts = new Set<string>();
+
+  // All possible host header sources, in order of preference.
+  const xfhost = req.headers.get('x-forwarded-host');
+  if (xfhost) {
+    // x-forwarded-host can be a comma-separated chain (client, proxy1, proxy2).
+    // The first entry is the original client-requested host.
+    xfhost.split(',').map((s) => s.trim()).filter(Boolean).forEach((h) => hosts.add(h));
   }
-  // Always include localhost dev origins as a fallback.
-  if (host !== 'localhost:3000') {
-    selfOrigins.push('http://localhost:3000', 'https://localhost:3000');
-  }
-  return [...selfOrigins, ...extra];
+  const xohost = req.headers.get('x-original-host');
+  if (xohost) hosts.add(xohost);
+  const host = req.headers.get('host');
+  if (host) hosts.add(host);
+  if (req.nextUrl?.host) hosts.add(req.nextUrl.host);
+
+  // Always include localhost dev origins as a fallback for dev mode.
+  hosts.add('localhost:3000');
+  hosts.add('localhost');
+
+  return Array.from(hosts);
 }
 
 // Extract just the host portion from an Origin or Referer URL — used for
@@ -178,16 +181,27 @@ export function checkOrigin(req: NextRequest): boolean {
   }
   const origin = req.headers.get('origin');
   const referer = req.headers.get('referer');
-  const allowed = getAllowedOrigins(req);
-  const allowedHosts = allowed.map(extractHost).filter((h): h is string => Boolean(h));
+  const allowedHosts = getAllowedHosts(req);
 
-  // If Origin header is present, it must match an allowed origin.
+  // Additionally, allow explicit ALLOWED_ORIGINS env var (for multi-domain setups).
+  const extraAllowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const extraAllowedHosts = extraAllowedOrigins.map(extractHost).filter((h): h is string => Boolean(h));
+  const allAllowedHosts = [...allowedHosts, ...extraAllowedHosts];
+
+  // If Origin header is present, its host must match an allowed host.
   if (origin) {
     const originHost = extractHost(origin);
-    if (originHost && allowedHosts.includes(originHost)) return true;
+    if (originHost && allAllowedHosts.includes(originHost)) return true;
     securityLog('origin_rejected', 'warn', {
       origin,
-      allowed,
+      originHost,
+      allowedHosts: allAllowedHosts,
+      requestHost: req.headers.get('host'),
+      xForwardedHost: req.headers.get('x-forwarded-host'),
+      xOriginalHost: req.headers.get('x-original-host'),
       ipHash: hashIp(getClientIp(req)),
       endpoint: req.nextUrl?.pathname || req.url,
       method,
@@ -200,9 +214,11 @@ export function checkOrigin(req: NextRequest): boolean {
   // of these on POST).
   if (referer) {
     const refererHost = extractHost(referer);
-    if (refererHost && allowedHosts.includes(refererHost)) return true;
+    if (refererHost && allAllowedHosts.includes(refererHost)) return true;
     securityLog('origin_rejected', 'warn', {
       referer,
+      refererHost,
+      allowedHosts: allAllowedHosts,
       ipHash: hashIp(getClientIp(req)),
       endpoint: req.nextUrl?.pathname || req.url,
       method,
