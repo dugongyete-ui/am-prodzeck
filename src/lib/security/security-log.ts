@@ -23,6 +23,8 @@ type SecurityEvent =
   | 'rate_limit_hit'
   | 'csrf_invalid'
   | 'origin_rejected'
+  | 'origin_mismatch_but_allowed'
+  | 'referer_mismatch_but_allowed'
   | 'signature_invalid'
   | 'nonce_replay'
   | 'timestamp_skew'
