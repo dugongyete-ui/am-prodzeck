@@ -104,6 +104,40 @@ never commit `.env` to git).
 - `TRUSTED_PROXY_CIDRS` (env var, optional): comma-separated CIDRs trusted
   to set `X-Forwarded-For`. Set to your CDN's CIDRs in production.
 
+## Keeping the App Warm (anti-cold-start cron)
+
+Serverless platforms (Alibaba Function Compute, Vercel, AWS Lambda, etc.)
+put idle functions to sleep after a few minutes of inactivity. The next
+request then suffers cold-start latency (often 1–5+ seconds).
+
+To prevent this, set up a free cron-job service to ping the health
+endpoint every 5 minutes:
+
+```
+GET https://dzeck-alightmotion.space-z.ai/api/health
+```
+
+Response: `{"ok":true,"status":"healthy","ts":"...","uptimeSec":N}`
+
+### Recommended free cron-job services
+
+- **cron-job.org** — free, EU-based, supports 1-min intervals on free tier
+- **UptimeRobot** — free tier, 5-min minimum interval
+- **EasyCron** — free tier with 5-min minimum
+- **GitHub Actions** — scheduled workflow, free for public repos
+
+### Setup steps (cron-job.org example)
+
+1. Create a free account at https://cron-job.org
+2. Click "Create Cronjob"
+3. URL: `https://dzeck-alightmotion.space-z.ai/api/health`
+4. Schedule: `*/5 * * * *` (every 5 min)
+5. Method: GET
+6. Save
+
+The endpoint is unauthenticated, lightweight (no DB call), and returns
+`Cache-Control: no-store` so cron services always get fresh responses.
+
 ## Security Architecture
 
 This app implements server-side hardening against scraping and automated
